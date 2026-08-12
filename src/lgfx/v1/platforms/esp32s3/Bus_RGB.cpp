@@ -372,9 +372,21 @@ namespace lgfx
       // IRQ dediee au canal GDMA lui-meme (OUT_EOF_CH_INT), distincte de
       // l'IRQ LCD_CAM/VSYNC partagee deja installee plus bas dans cette
       // fonction : jamais utilisee jusqu'ici dans ce driver.
+      //
+      // PAS de ESP_INTR_FLAG_IRAM ici (contrairement a une premiere version
+      // de ce patch) : cette ISR lit _frame_buffer, qui est en PSRAM, donc
+      // derriere le meme cache/MMU que la flash. ESP_INTR_FLAG_IRAM force
+      // une ISR a s'executer MEME quand ce cache est desactive (ex: pendant
+      // une ecriture NVS/flash ailleurs dans l'app) - dans ce cas la lecture
+      // PSRAM plante immediatement ("Cache disabled but cached memory region
+      // accessed", constate en pratique). Sans ce flag, l'IRQ est simplement
+      // suspendue le temps de l'operation flash (comme l'est deja
+      // lcd_default_isr_handler ci-dessus, qui n'a jamais eu ce flag) puis
+      // reprend normalement ensuite - au pire quelques images figees
+      // brievement pendant un enregistrement NVS, jamais un plantage.
       GDMA.channel[_dma_ch].out.int_ena.out_eof = 1;
       int bounce_irq_id = gdma_periph_signals.groups[0].pairs[_dma_ch].tx_irq_id;
-      esp_intr_alloc(bounce_irq_id, ESP_INTR_FLAG_IRAM, lcd_bounce_refill_isr_handler, this, &_bounce_intr_handle);
+      esp_intr_alloc(bounce_irq_id, ESP_INTR_FLAG_LOWMED, lcd_bounce_refill_isr_handler, this, &_bounce_intr_handle);
 
       // Amorce chunk0->A / chunk1->B pour la toute premiere image (les VSYNC
       // suivants refont la meme chose via lcd_default_isr_handler), puis
