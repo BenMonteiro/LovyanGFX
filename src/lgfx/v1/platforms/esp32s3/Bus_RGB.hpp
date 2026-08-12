@@ -153,10 +153,13 @@ namespace lgfx
   private:
     // 20 lignes teste et REJETE : a introduit un artefact de "dedoublement"
     // d'image nettement pire que le defaut d'origine (pas juste inefficace,
-    // activement pire). Revenu a 10 (comportement au moins aussi stable que
-    // sans bounce buffer sous charge audio, meilleur sans audio - cf. les
-    // deux tests precedents).
-    static constexpr size_t kBounceLines = 10;
+    // activement pire). 10 lignes : au moins aussi stable que sans bounce
+    // buffer sous charge audio, meilleur sans audio, mais aucune amelioration
+    // du defaut audio lui-meme. Teste maintenant a 5 (~285us de marge/refill,
+    // ~96 refills/trame) : moins de marge par refill mais rafraichissements
+    // deux fois plus frequents/petits, pourrait mieux repartir la charge sous
+    // contention - hypothese non garantie, a valider empiriquement.
+    static constexpr size_t kBounceLines = 5;
     uint8_t* _bounceA = nullptr;
     uint8_t* _bounceB = nullptr;
     dma_descriptor_t* _dmadesc_bounce_a = nullptr;
