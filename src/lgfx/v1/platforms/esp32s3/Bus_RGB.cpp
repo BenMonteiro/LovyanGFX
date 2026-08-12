@@ -90,9 +90,17 @@ namespace lgfx
     uint32_t intr_status = dev->lc_dma_int_st.val & 0x03;
     dev->lc_dma_int_clr.val = intr_status;
     if (intr_status & LCD_LL_EVENT_VSYNC_END) {
+      // Etape 3 : resynchronisation garantie du bounce buffer en debut de
+      // trame - recopie systematiquement chunk0->A / chunk1->B, quel que
+      // soit l'etat ou en etaient les refills de la trame precedente. Evite
+      // toute dependance a un phasage parfait entre rafraichissements
+      // (~48/trame) et VSYNC (1/trame). Cout borne (2 memcpy de la taille
+      // d'un segment, meme ordre de grandeur qu'un refill normal).
+      me->primeBounceBuffers();
+
       GDMA.channel[me->_dma_ch].out.conf0.out_rst = 1;
       GDMA.channel[me->_dma_ch].out.conf0.out_rst = 0;
-      GDMA.channel[me->_dma_ch].out.link.addr = (uintptr_t)&(me->_dmadesc_restart);
+      GDMA.channel[me->_dma_ch].out.link.addr = (uintptr_t)&(me->_dmadesc_bounce_restart);
       GDMA.channel[me->_dma_ch].out.link.start = 1;
 
     // bool need_yield = false;
@@ -112,21 +120,40 @@ namespace lgfx
     }
   }
 
+  IRAM_ATTR void Bus_RGB::primeBounceBuffers(void)
+  {
+    memcpy(_bounceA, _frame_buffer, _bounce_chunk_bytes);
+    memcpy(_bounceB, _frame_buffer + _bounce_chunk_bytes, _bounce_chunk_bytes);
+    _bounce_next_chunk = 2;
+    _bounce_refill_is_a = true; // le prochain refill (declenche par le out_eof de A) doit rafraichir A
+  }
+
   // Bounce buffer : IRQ dediee au canal GDMA lui-meme (OUT_EOF_CH_INT), qui se
   // declenche quand le GDMA a fini de LIRE (pas encore transmis) le contenu
-  // pointe par un descripteur - donc des qu'un demi-tampon (A ou B) n'est
-  // plus necessaire au GDMA, avant meme qu'il ait fini d'etre pousse vers le
-  // panneau. C'est la marge utilisee pour reactualiser l'autre demi-tampon.
-  // ETAPE 2 : incremente juste un compteur, ne touche a rien de critique
-  // (jamais d'allocation/log dans une ISR).
+  // pointe par un descripteur marque suc_eof - donc quand un demi-tampon (A
+  // ou B) vient d'etre entierement lu et n'est plus necessaire au GDMA :
+  // c'est le signal pour le rafraichir avec le PROCHAIN segment dont il aura
+  // besoin (motif "ping-pong" standard, cf. commentaire officiel Espressif
+  // sur le bounce buffer). La chaine A->B->A->B... est fixe (construite une
+  // fois dans init()) : ce declenchement alterne donc automatiquement entre
+  // A et B au meme rythme que le GDMA, sans avoir besoin de savoir lequel
+  // vient precisement de se terminer.
   IRAM_ATTR void Bus_RGB::lcd_bounce_refill_isr_handler(void* args)
   {
     Bus_RGB* me = (Bus_RGB*)args;
-    if (GDMA.channel[me->_dma_ch].out.int_st.out_eof)
+    if (!GDMA.channel[me->_dma_ch].out.int_st.out_eof)
     {
-      GDMA.channel[me->_dma_ch].out.int_clr.out_eof = 1;
-      ++me->_bounce_eof_count;
+      return;
     }
+    GDMA.channel[me->_dma_ch].out.int_clr.out_eof = 1;
+    ++me->_bounce_eof_count;
+
+    uint8_t* dst = me->_bounce_refill_is_a ? me->_bounceA : me->_bounceB;
+    me->_bounce_refill_is_a = !me->_bounce_refill_is_a;
+
+    const uint8_t* src = me->_frame_buffer + (size_t)me->_bounce_next_chunk * me->_bounce_chunk_bytes;
+    memcpy(dst, src, me->_bounce_chunk_bytes);
+    me->_bounce_next_chunk = (me->_bounce_next_chunk + 1) % me->_bounce_total_chunks;
   }
 
   static void _gpio_pin_sig(uint32_t pin, uint32_t sig)
@@ -277,14 +304,11 @@ namespace lgfx
     // directs a la PSRAM (cf. depot applicatif, branche "crowpanel-bounce-
     // buffer" pour le contexte complet du probleme).
     //
-    // ETAPE 2 (en cours) : allocation des tampons/descripteurs + activation
-    // de l'IRQ out_eof, MAIS PAS ENCORE branches sur le GDMA actif - celui-ci
-    // continue de scanner l'ancien anneau complet (_dmadesc) exactement comme
-    // avant ce patch (out.link.addr n'est pas touche ici). But de cette
-    // etape : valider que l'IRQ out_eof se declenche reellement, a la
-    // frequence attendue, sur ce silicium/cette version d'IDF, AVANT de lui
-    // faire faire quoi que ce soit de critique (etape 3 : memcpy de refill +
-    // branchement reel).
+    // ETAPE 3 : branchement reel. out.link.addr est redirige vers la chaine
+    // bounce (voir fin de bloc) - l'ancien anneau complet (_dmadesc) reste
+    // alloue mais n'est plus scanne (nettoyage differe, cf. plan). L'etape 2
+    // a deja valide que l'IRQ out_eof se declenche correctement sur ce
+    // silicium/cette version d'IDF avant d'en arriver la.
     {
       // _cfg.panel->width() (pas "active_width", qui n'est declare que plus
       // bas dans cette fonction) : meme valeur, cf. la declaration existante
@@ -330,12 +354,39 @@ namespace lgfx
       fillChain(_bounceA, _dmadesc_bounce_a, _dmadesc_bounce_b);
       fillChain(_bounceB, _dmadesc_bounce_b, _dmadesc_bounce_a);
 
+      _bounce_chunk_bytes = bounceBytes;
+      _bounce_total_chunks = _cfg.panel->height() / kBounceLines;
+      // kBounceLines doit diviser exactement la hauteur du panneau (480/10 =
+      // 48, pas de segment final partiel a gerer) - vrai pour ce projet
+      // (panneau fixe 800x480), a revalider si jamais reutilise ailleurs.
+
+      // Equivalent bounce de _dmadesc_restart ci-dessus (meme raison d'etre :
+      // compenser le contenu deja present dans le FIFO L2 au moment d'un
+      // restart), construit a partir du premier descripteur de A.
+      memcpy(&_dmadesc_bounce_restart, _dmadesc_bounce_a, sizeof(_dmadesc_bounce_restart));
+      auto pb = (uint8_t*)(_dmadesc_bounce_restart.buffer);
+      _dmadesc_bounce_restart.buffer = &pb[skip_bytes];
+      _dmadesc_bounce_restart.dw0.length -= skip_bytes;
+      _dmadesc_bounce_restart.dw0.size -= skip_bytes;
+
       // IRQ dediee au canal GDMA lui-meme (OUT_EOF_CH_INT), distincte de
       // l'IRQ LCD_CAM/VSYNC partagee deja installee plus bas dans cette
       // fonction : jamais utilisee jusqu'ici dans ce driver.
       GDMA.channel[_dma_ch].out.int_ena.out_eof = 1;
       int bounce_irq_id = gdma_periph_signals.groups[0].pairs[_dma_ch].tx_irq_id;
       esp_intr_alloc(bounce_irq_id, ESP_INTR_FLAG_IRAM, lcd_bounce_refill_isr_handler, this, &_bounce_intr_handle);
+
+      // Amorce chunk0->A / chunk1->B pour la toute premiere image (les VSYNC
+      // suivants refont la meme chose via lcd_default_isr_handler), puis
+      // redirige le GDMA vers la chaine bounce plutot que l'ancien anneau
+      // complet demarre juste plus haut - sans consequence visuelle, ceci se
+      // produit bien avant que dev->lcd_user.lcd_start (plus bas dans cette
+      // fonction) ne declenche reellement la generation de l'horloge pixel.
+      primeBounceBuffers();
+      GDMA.channel[_dma_ch].out.conf0.out_rst = 1;
+      GDMA.channel[_dma_ch].out.conf0.out_rst = 0;
+      GDMA.channel[_dma_ch].out.link.addr = (uintptr_t)&(_dmadesc_bounce_restart);
+      GDMA.channel[_dma_ch].out.link.start = 1;
     }
     //////////////////////////////////////////////
 

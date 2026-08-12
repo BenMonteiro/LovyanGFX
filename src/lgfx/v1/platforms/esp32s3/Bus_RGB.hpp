@@ -156,10 +156,20 @@ namespace lgfx
     uint8_t* _bounceB = nullptr;
     dma_descriptor_t* _dmadesc_bounce_a = nullptr;
     dma_descriptor_t* _dmadesc_bounce_b = nullptr;
+    dma_descriptor_t _dmadesc_bounce_restart; // etape 3 : equivalent bounce de _dmadesc_restart
     size_t _bounce_desc_count_a = 0;
     size_t _bounce_desc_count_b = 0;
+    size_t _bounce_chunk_bytes = 0;   // etape 3 : octets d'un segment (kBounceLines lignes)
+    uint32_t _bounce_total_chunks = 0; // etape 3 : nb de segments par image (height / kBounceLines)
+    uint32_t _bounce_next_chunk = 0;   // etape 3 : prochain segment a copier depuis _frame_buffer
+    bool _bounce_refill_is_a = true;   // etape 3 : le prochain refill cible A (true) ou B (false)
     intr_handle_t _bounce_intr_handle = nullptr;
     volatile uint32_t _bounce_eof_count = 0;
+    // Recopie chunk0->A / chunk1->B et reinitialise l'etat d'alternance :
+    // appelee une fois depuis init() (premiere image) et a chaque VSYNC
+    // depuis lcd_default_isr_handler (resynchronisation de debut de trame,
+    // etape 3) - IRAM_ATTR car appelable depuis une ISR.
+    IRAM_ATTR void primeBounceBuffers(void);
     static void lcd_bounce_refill_isr_handler(void* args);
   };
 
