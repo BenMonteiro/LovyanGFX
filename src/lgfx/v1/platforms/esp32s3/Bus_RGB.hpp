@@ -151,7 +151,12 @@ namespace lgfx
     // fois que l'IRQ out_eof du canal GDMA s'est declenchee depuis le demarrage.
     uint32_t debugBounceEofCount(void) const { return _bounce_eof_count; }
   private:
-    static constexpr size_t kBounceLines = 10;
+    // 10 lignes (~570us de marge/refill) n'absorbe pas la contention causee
+    // par le DMA audio I2S actif (aucune amelioration constatee en pratique
+    // par rapport a l'absence de bounce buffer). Teste a 20 (~1,14ms de
+    // marge) pour voir si une fenetre plus large suffit - au prix d'une
+    // cadence de rafraichissement plus faible (moins de refills/trame).
+    static constexpr size_t kBounceLines = 20;
     uint8_t* _bounceA = nullptr;
     uint8_t* _bounceB = nullptr;
     dma_descriptor_t* _dmadesc_bounce_a = nullptr;
