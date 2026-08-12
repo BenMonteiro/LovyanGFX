@@ -252,6 +252,16 @@ namespace lgfx
 
     GDMA.channel[_dma_ch].out.peri_sel.sel = SOC_GDMA_TRIG_PERIPH_LCD0;
 
+    // Priorite maximale (0-15, "the larger the value, the higher the
+    // priority") pour l'arbitrage GDMA de ce canal : le DMA audio I2S (canal
+    // GDMA distinct, alloue par son propre driver, jamais mis a une priorite
+    // explicite - donc 0 par defaut) entre en concurrence pour le meme bus/
+    // controleur memoire. Favoriser ce canal ecran a l'arbitrage ne touche a
+    // rien du driver I2S (aucun des echecs precedents ne venait de la, cf.
+    // depot applicatif) - risque minimal, tente pour reduire la contention
+    // sans repasser par des changements d'etat marche/arret du driver I2S.
+    GDMA.channel[_dma_ch].out.pri.tx_pri = 15;
+
     typeof(GDMA.channel[0].out.conf0) conf0;
     conf0.val = 0;
     conf0.out_eof_mode = 1;
