@@ -49,6 +49,7 @@ Contributors:
 #endif
 #include <soc/gdma_reg.h>
 #include <soc/gdma_struct.h>
+#include <soc/gdma_periph.h>
 
 #if __has_include (<esp_private/periph_ctrl.h>)
  #include <esp_private/periph_ctrl.h>
@@ -108,6 +109,23 @@ namespace lgfx
         // if (need_yield) {
         //     portYIELD_FROM_ISR();
         // }
+    }
+  }
+
+  // Bounce buffer : IRQ dediee au canal GDMA lui-meme (OUT_EOF_CH_INT), qui se
+  // declenche quand le GDMA a fini de LIRE (pas encore transmis) le contenu
+  // pointe par un descripteur - donc des qu'un demi-tampon (A ou B) n'est
+  // plus necessaire au GDMA, avant meme qu'il ait fini d'etre pousse vers le
+  // panneau. C'est la marge utilisee pour reactualiser l'autre demi-tampon.
+  // ETAPE 2 : incremente juste un compteur, ne touche a rien de critique
+  // (jamais d'allocation/log dans une ISR).
+  IRAM_ATTR void Bus_RGB::lcd_bounce_refill_isr_handler(void* args)
+  {
+    Bus_RGB* me = (Bus_RGB*)args;
+    if (GDMA.channel[me->_dma_ch].out.int_st.out_eof)
+    {
+      GDMA.channel[me->_dma_ch].out.int_clr.out_eof = 1;
+      ++me->_bounce_eof_count;
     }
   }
 
@@ -253,6 +271,73 @@ namespace lgfx
     _dmadesc_restart.dw0.length -= skip_bytes;
     _dmadesc_restart.dw0.size -= skip_bytes;
 
+    //////////////////////////////////////////////
+    // Bounce buffer (SRAM interne) : reduit la contention bus/PSRAM avec le
+    // DMA audio I2S en decouplant le scan continu de l'ecran des acces
+    // directs a la PSRAM (cf. depot applicatif, branche "crowpanel-bounce-
+    // buffer" pour le contexte complet du probleme).
+    //
+    // ETAPE 2 (en cours) : allocation des tampons/descripteurs + activation
+    // de l'IRQ out_eof, MAIS PAS ENCORE branches sur le GDMA actif - celui-ci
+    // continue de scanner l'ancien anneau complet (_dmadesc) exactement comme
+    // avant ce patch (out.link.addr n'est pas touche ici). But de cette
+    // etape : valider que l'IRQ out_eof se declenche reellement, a la
+    // frequence attendue, sur ce silicium/cette version d'IDF, AVANT de lui
+    // faire faire quoi que ce soit de critique (etape 3 : memcpy de refill +
+    // branchement reel).
+    {
+      // _cfg.panel->width() (pas "active_width", qui n'est declare que plus
+      // bas dans cette fonction) : meme valeur, cf. la declaration existante
+      // de active_width juste apres ce bloc.
+      const size_t bounceBytes = kBounceLines * _cfg.panel->width() * pixel_bytes;
+
+      auto allocChain = [](size_t bytes, uint8_t** outBuf, dma_descriptor_t** outChain, size_t* outCount)
+      {
+        // MALLOC_CAP_INTERNAL (contrairement a heap_alloc_dma() plus haut
+        // dans ce fichier, qui accepte aussi la PSRAM) : c'est tout l'interet
+        // du bounce buffer, la PSRAM octale de cette puce etant elle-meme
+        // accessible en DMA, MALLOC_CAP_DMA seul ne garantit pas un
+        // placement en SRAM interne rapide/non contendue.
+        *outBuf = (uint8_t*)heap_caps_malloc((bytes + 3) & ~3, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+        *outCount = (bytes - 1) / MAX_DMA_LEN + 1;
+        *outChain = (dma_descriptor_t*)heap_caps_malloc(sizeof(dma_descriptor_t) * (*outCount), MALLOC_CAP_DMA);
+      };
+      allocChain(bounceBytes, &_bounceA, &_dmadesc_bounce_a, &_bounce_desc_count_a);
+      allocChain(bounceBytes, &_bounceB, &_dmadesc_bounce_b, &_bounce_desc_count_b);
+
+      // Meme algorithme de decoupage que l'anneau principal ci-dessus, mais
+      // sur un tampon de kBounceLines lignes au lieu de l'image complete, et
+      // bouclant en alternance A -> B -> A -> B... (topologie finale deja en
+      // place, prete pour l'etape 3 - seul out.link.addr reste a rebrancher).
+      auto fillChain = [bounceBytes](uint8_t* buf, dma_descriptor_t* chain, dma_descriptor_t* nextChainHead)
+      {
+        auto dmadesc = chain;
+        auto data = buf;
+        size_t len = bounceBytes;
+        while (len > MAX_DMA_LEN)
+        {
+          len -= MAX_DMA_LEN;
+          dmadesc->buffer = data;
+          data += MAX_DMA_LEN;
+          *(uint32_t*)dmadesc = MAX_DMA_LEN | MAX_DMA_LEN << 12 | 0x80000000;
+          dmadesc->next = dmadesc + 1;
+          dmadesc++;
+        }
+        *(uint32_t*)dmadesc = ((len + 3) & ( ~3 )) | len << 12 | 0xC0000000;
+        dmadesc->buffer = data;
+        dmadesc->next = nextChainHead;
+      };
+      fillChain(_bounceA, _dmadesc_bounce_a, _dmadesc_bounce_b);
+      fillChain(_bounceB, _dmadesc_bounce_b, _dmadesc_bounce_a);
+
+      // IRQ dediee au canal GDMA lui-meme (OUT_EOF_CH_INT), distincte de
+      // l'IRQ LCD_CAM/VSYNC partagee deja installee plus bas dans cette
+      // fonction : jamais utilisee jusqu'ici dans ce driver.
+      GDMA.channel[_dma_ch].out.int_ena.out_eof = 1;
+      int bounce_irq_id = gdma_periph_signals.groups[0].pairs[_dma_ch].tx_irq_id;
+      esp_intr_alloc(bounce_irq_id, ESP_INTR_FLAG_IRAM, lcd_bounce_refill_isr_handler, this, &_bounce_intr_handle);
+    }
+    //////////////////////////////////////////////
 
     uint32_t hsw = _cfg.hsync_pulse_width;
     uint32_t hbp = _cfg.hsync_back_porch;
@@ -359,6 +444,14 @@ namespace lgfx
 
   void Bus_RGB::release(void)
   {
+    if (_bounce_intr_handle) {
+      esp_intr_free(_bounce_intr_handle);
+      _bounce_intr_handle = nullptr;
+    }
+    if (_dmadesc_bounce_a) { heap_caps_free(_dmadesc_bounce_a); _dmadesc_bounce_a = nullptr; }
+    if (_dmadesc_bounce_b) { heap_caps_free(_dmadesc_bounce_b); _dmadesc_bounce_b = nullptr; }
+    if (_bounceA) { heap_caps_free(_bounceA); _bounceA = nullptr; }
+    if (_bounceB) { heap_caps_free(_bounceB); _bounceB = nullptr; }
     if (_intr_handle) {
       esp_intr_free(_intr_handle);
     }

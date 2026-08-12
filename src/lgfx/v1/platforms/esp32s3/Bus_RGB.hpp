@@ -139,6 +139,28 @@ namespace lgfx
     uint8_t *_frame_buffer = nullptr;
     intr_handle_t _intr_handle;
     static void lcd_default_isr_handler(void *args);
+
+    // --- Bounce buffer (reduction de la contention bus/PSRAM avec le DMA
+    // audio I2S, cf. commit dans le projet applicatif "crowpanel-bounce-buffer") ---
+    // Etape 2 (instrumentation seule) : allocation + IRQ out_eof en place,
+    // mais PAS ENCORE branches sur le GDMA actif (qui continue de scanner
+    // l'ancien anneau complet _dmadesc, comme avant ce patch). L'ISR ne fait
+    // qu'incrementer un compteur (jamais de log/allocation dans une ISR).
+  public:
+    // Expose temporairement pour validation materielle (etape 2) : nombre de
+    // fois que l'IRQ out_eof du canal GDMA s'est declenchee depuis le demarrage.
+    uint32_t debugBounceEofCount(void) const { return _bounce_eof_count; }
+  private:
+    static constexpr size_t kBounceLines = 10;
+    uint8_t* _bounceA = nullptr;
+    uint8_t* _bounceB = nullptr;
+    dma_descriptor_t* _dmadesc_bounce_a = nullptr;
+    dma_descriptor_t* _dmadesc_bounce_b = nullptr;
+    size_t _bounce_desc_count_a = 0;
+    size_t _bounce_desc_count_b = 0;
+    intr_handle_t _bounce_intr_handle = nullptr;
+    volatile uint32_t _bounce_eof_count = 0;
+    static void lcd_bounce_refill_isr_handler(void* args);
   };
 
 //----------------------------------------------------------------------------
